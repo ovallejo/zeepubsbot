@@ -266,6 +266,9 @@ class FileManager:
                 'message': 'Error con portada, continuando sin ella'
             }
 
+    # REEMPLAZAR el método _upload_cover_to_telegram en file_manager.py
+    # Líneas 199-230 aproximadamente
+
     async def _upload_cover_to_telegram(
             self,
             cover_data: bytes,
@@ -282,15 +285,18 @@ class FileManager:
             file_id de la imagen o None si falla
         """
         try:
+            # Obtener chat_id desde el Update almacenado en bot_data
+            chat_id = context.bot_data.get('current_upload_chat_id', self.config.developer_chat_id)
+
             message = await context.bot.send_photo(
-                chat_id=self.config.developer_chat_id,
+                chat_id=chat_id,
                 photo=cover_data
             )
 
             # Retornar file_id de la imagen de mejor calidad
             if message.photo:
                 cover_id = message.photo[-1].file_id
-                self.logger.debug("Portada subida exitosamente")
+                self.logger.debug(f"Portada subida exitosamente al chat {chat_id}")
                 return cover_id
 
             return None
@@ -299,6 +305,58 @@ class FileManager:
             log_service_error("FileManager", e)
             self.logger.error(f"Error subiendo portada a Telegram: {e}")
             return None
+
+    async def _process_cover(
+            self,
+            book: Book,
+            context: ContextTypes.DEFAULT_TYPE
+    ) -> Dict[str, Any]:
+        """
+        Procesa y sube portada del libro a Telegram.
+
+        Args:
+            book: Modelo Book con posible cover_data
+            context: Contexto del bot
+
+        Returns:
+            Dict con resultado del procesamiento de portada
+        """
+        # Verificar si hay cover_data temporal
+        cover_data = getattr(book, '_cover_data', None)
+
+        if not cover_data:
+            return {'success': True, 'message': 'Sin portada disponible'}
+
+        try:
+            # Validar tamaño de portada (10MB máximo)
+            max_size = 10 * 1024 * 1024
+            if len(cover_data) > max_size:
+                self.logger.warning("Portada demasiado grande, omitiendo")
+                return {'success': True, 'message': 'Portada omitida (muy grande)'}
+
+            # Subir portada a Telegram pasando el chat_id del contexto
+            cover_id = await self._upload_cover_to_telegram(cover_data, context)
+
+            if cover_id:
+                self.logger.info("Portada procesada exitosamente")
+                return {
+                    'success': True,
+                    'cover_id': cover_id,
+                    'message': 'Portada procesada exitosamente'
+                }
+            else:
+                return {
+                    'success': True,
+                    'message': 'Error subiendo portada, continuando sin ella'
+                }
+
+        except Exception as e:
+            log_service_error("FileManager", e, {"book_id": book.book_id})
+            self.logger.error(f"Error procesando portada: {e}")
+            return {
+                'success': True,
+                'message': 'Error con portada, continuando sin ella'
+            }
 
     def _cleanup_temp_file(self, file_path: Path) -> None:
         """Limpia archivo temporal de forma segura."""
