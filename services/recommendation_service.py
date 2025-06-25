@@ -6,6 +6,7 @@ Ubicación: services/recommendation_service.py
 """
 
 import asyncio
+import time
 from typing import Dict, Any, Optional, List, Tuple
 
 from openai import OpenAI
@@ -60,7 +61,7 @@ class RecommendationService:
             update: Update,
             context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Procesa solicitud de recomendación con streaming."""
+        """Procesa solicitud de recomendación con streaming mejorado."""
         try:
             user_id = update.effective_user.id
             self.logger.info(f"Procesando recomendación para usuario {user_id}")
@@ -92,7 +93,10 @@ class RecommendationService:
                 parse_mode="Markdown"
             )
 
-            # Generar recomendación
+            # *** PAUSA INICIAL para evitar flood desde el inicio ***
+            await asyncio.sleep(1.5)
+
+            # Generar recomendación con streaming controlado
             await self._generate_streaming_recommendation(
                 user_message.strip(), processing_msg, context
             )
@@ -151,10 +155,17 @@ class RecommendationService:
             processing_msg,
             context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Maneja la respuesta en streaming de la API."""
+        """Maneja la respuesta en streaming con control de flood mejorado."""
         buffer = ""
         update_counter = 0
-        last_update_length = 0
+        last_update_time = time.time()
+        last_significant_length = 0
+
+        # Control de flood más inteligente
+        MIN_UPDATE_INTERVAL = 3.0  # Mínimo 3 segundos entre actualizaciones
+        MIN_CONTENT_CHANGE = 100  # Mínimo 100 caracteres de cambio
+        MAX_UPDATES_PER_RESPONSE = 8  # Máximo 8 actualizaciones por respuesta
+        total_updates = 0
 
         try:
             for chunk in response:
@@ -162,27 +173,114 @@ class RecommendationService:
                     buffer += chunk.choices[0].delta.content
                     update_counter += 1
 
-                    # Actualizar mensaje periódicamente
-                    if update_counter % 30 == 0 and len(buffer) > last_update_length + 50:
-                        await self._update_streaming_message(
-                            processing_msg, buffer, context, show_cursor=True
-                        )
-                        last_update_length = len(buffer)
+                    current_time = time.time()
+                    time_since_last_update = current_time - last_update_time
+                    content_change = len(buffer) - last_significant_length
 
-            # Mensaje final sin cursor
+                    # Condiciones para actualizar (TODAS deben cumplirse):
+                    should_update = (
+                            total_updates < MAX_UPDATES_PER_RESPONSE and
+                            time_since_last_update >= MIN_UPDATE_INTERVAL and
+                            content_change >= MIN_CONTENT_CHANGE and
+                            update_counter % 50 == 0  # Cada 50 chunks (no 30)
+                    )
+
+                    if should_update:
+                        try:
+                            await self._update_streaming_message_safe(
+                                processing_msg, buffer, context, show_cursor=True
+                            )
+                            last_update_time = current_time
+                            last_significant_length = len(buffer)
+                            total_updates += 1
+
+                            # Log para debug
+                            self.logger.debug(f"Streaming update #{total_updates}: {len(buffer)} chars")
+
+                        except Exception as e:
+                            # Si hay error, aumentar el intervalo para la próxima vez
+                            if "flood" in str(e).lower() or "429" in str(e):
+                                MIN_UPDATE_INTERVAL = min(MIN_UPDATE_INTERVAL * 1.5, 10.0)
+                                self.logger.warning(f"Flood detectado, aumentando intervalo a {MIN_UPDATE_INTERVAL}s")
+                            else:
+                                self.logger.debug(f"Error en streaming update: {e}")
+
+            # Mensaje final sin cursor - SIEMPRE enviar
             final_text = buffer.strip() if buffer.strip() else (
                 self.message_formatter.format_recommendation_status('unavailable')
             )
 
+            # Esperar un poco antes del mensaje final si acabamos de actualizar
+            if total_updates > 0:
+                await asyncio.sleep(2.0)
+
             await processing_msg.edit_text(final_text, parse_mode="Markdown")
+            self.logger.info(f"✅ Streaming completado: {len(final_text)} chars, {total_updates} actualizaciones")
 
         except Exception as e:
             log_service_error("RecommendationService", e)
             self.logger.error(f"Error en streaming: {e}")
 
-            # Mensaje de error en caso de fallo
-            error_message = self.message_formatter.format_recommendation_status('unavailable')
-            await processing_msg.edit_text(error_message, parse_mode="Markdown")
+            # Mensaje de error en caso de fallo - SIN editar si acabamos de tener flood
+            if "flood" not in str(e).lower() and "429" not in str(e):
+                try:
+                    error_message = self.message_formatter.format_recommendation_status('unavailable')
+                    await processing_msg.edit_text(error_message, parse_mode="Markdown")
+                except:
+                    pass  # Si falla, no hacer nada más
+
+    async def _update_streaming_message_safe(
+            self,
+            message,
+            content: str,
+            context: ContextTypes.DEFAULT_TYPE,
+            show_cursor: bool = False
+    ) -> None:
+        """Actualiza mensaje durante streaming con protección contra flood."""
+        try:
+            # Preparar texto con cursor opcional
+            display_text = content.strip()
+            if show_cursor:
+                display_text += " ▌"
+
+            # Validar longitud - IMPORTANTE: usar límite más conservador
+            max_length = min(self.config.max_message_length - 200, 3800)  # Margen de seguridad
+            if len(display_text) > max_length:
+                # Truncar de forma inteligente
+                truncated = display_text[:max_length - 50]
+                # Buscar último punto o espacio para cortar mejor
+                last_period = truncated.rfind('.')
+                last_space = truncated.rfind(' ')
+
+                if last_period > max_length * 0.8:
+                    display_text = display_text[:last_period + 1] + "..."
+                elif last_space > max_length * 0.8:
+                    display_text = display_text[:last_space] + "..."
+                else:
+                    display_text = truncated + "..."
+
+            # NO enviar acción de typing para evitar requests adicionales
+            # Directamente editar el mensaje
+            await message.edit_text(display_text, parse_mode="Markdown")
+
+        except Exception as e:
+            # Si es flood control, propagarlo para manejo superior
+            if "flood" in str(e).lower() or "429" in str(e) or "Too Many Requests" in str(e):
+                raise e
+            else:
+                # Otros errores se ignoran silenciosamente
+                self.logger.debug(f"Error actualizando mensaje streaming (ignorado): {e}")
+
+    def _calculate_safe_update_interval(self, error_count: int = 0) -> float:
+        """Calcula intervalo seguro entre actualizaciones basado en errores previos."""
+        base_interval = 3.0  # Base de 3 segundos
+
+        # Aumentar exponencialmente si ha habido errores de flood
+        if error_count > 0:
+            multiplier = min(2 ** error_count, 8)  # Máximo 8x
+            return base_interval * multiplier
+
+        return base_interval
 
     async def _update_streaming_message(
             self,
@@ -219,7 +317,7 @@ class RecommendationService:
             self.logger.debug(f"Error actualizando mensaje streaming: {e}")
 
     def _build_system_prompt(self) -> str:
-        """Construye el prompt del sistema con la biblioteca disponible."""
+        """Construye el prompt del sistema con la biblioteca organizada."""
         try:
             # Obtener libros con estadísticas para mejor recomendación
             available_books = self.book_repository.get_books_for_recommendations()
@@ -234,68 +332,173 @@ class RecommendationService:
             popular_books = self.book_repository.find_popular(5)
 
             return f"""
-¡Hola! Soy Neko-chan, tu asistente literaria virtual 📚✨
+    ¡Hola! Soy Neko-chan, tu asistente literaria virtual 📚✨
 
-Como experta en literatura, mi misión es encontrar el libro perfecto para ti siguiendo estos principios:
+    Como experta en literatura, mi misión es encontrar el libro perfecto para ti siguiendo estos principios:
 
-🎯 **Mi proceso mágico:**
-- Analizo tus gustos y preferencias con cuidado
-- Identifico géneros, autores o temas que te emocionan
-- Busco en mi biblioteca de {total_books} libros los tesoros perfectos
-- Selecciono hasta 8 joyas únicas para máxima variedad
-- Incluyo descripciones detalladas de cada recomendación
-- Si no tengo exactamente lo que buscas, sugiero alternativas similares
+    🎯 **Mi proceso mágico:**
+    - Analizo tus gustos y preferencias con cuidado
+    - Identifico géneros, autores o temas que te emocionan
+    - Busco en mi biblioteca de {total_books} libros los tesoros perfectos
+    - Selecciono hasta 8 joyas únicas para máxima variedad
+    - Incluyo descripciones detalladas de cada recomendación
+    - Si no tengo exactamente lo que buscas, sugiero alternativas similares
 
-✨ **Mis características especiales:**
-- Uso emojis para expresarme mejor 😊
-- Siempre incluyo títulos diversos para sorprenderte
-- Los comandos mágicos (/<book_id>) están listos para usar
-- Mis respuestas son naturales pero precisas
-- Considero popularidad y calidad en mis sugerencias
+    ✨ **Mis características especiales:**
+    - Uso emojis para expresarme mejor 😊
+    - Siempre incluyo títulos diversos para sorprenderte
+    - Los comandos mágicos (/<book_id>) están listos para usar
+    - Mis respuestas son naturales pero precisas
+    - Considero popularidad y calidad en mis sugerencias
 
-📝 **Formato de respuesta:**
-/<book_id> | **Título del libro**
-*Descripción breve y atractiva del libro*
+    📝 **Formato de respuesta:**
+    /<book_id> | **Título del libro**
+    *Descripción breve y atractiva del libro*
 
-📊 **Biblioteca disponible:**
-{books_list}
+    {books_list}
 
-🔥 **Libros más populares actualmente:**
-{self._format_popular_books(popular_books)}
+    🔥 **Libros más populares actualmente:**
+    {self._format_popular_books(popular_books)}
 
-💡 **Tip:** Siempre busco ofrecer variedad en géneros, autores y estilos para enriquecer tu experiencia lectora.
-"""
+    💡 **Tip:** Siempre busco ofrecer variedad en géneros, autores y estilos para enriquecer tu experiencia lectora.
+    """
 
         except Exception as e:
             log_service_error("RecommendationService", e)
             return self._get_fallback_prompt()
 
+    def get_library_statistics(self) -> Dict[str, Any]:
+        """Obtiene estadísticas detalladas de la biblioteca para debugging."""
+        try:
+            available_books = self.book_repository.get_books_for_recommendations()
+
+            series_count = {}
+            standalone_count = 0
+
+            for book_id, title in available_books:
+                if any(indicator in title for indicator in [" - Vol.", " - Parte", " - Volume", " - Tomo"]):
+                    series_name = title
+                    for separator in [" - Vol.", " - Parte", " - Volume", " - Tomo"]:
+                        if separator in series_name:
+                            series_name = series_name.split(separator)[0].strip()
+                            break
+
+                    if series_name not in series_count:
+                        series_count[series_name] = 0
+                    series_count[series_name] += 1
+                else:
+                    standalone_count += 1
+
+            return {
+                'total_books': len(available_books),
+                'total_series': len(series_count),
+                'total_volumes': sum(series_count.values()),
+                'standalone_books': standalone_count,
+                'largest_series': max(series_count.items(), key=lambda x: x[1]) if series_count else None,
+                'series_breakdown': dict(sorted(series_count.items(), key=lambda x: x[1], reverse=True)[:10])
+            }
+
+        except Exception as e:
+            log_service_error("RecommendationService", e)
+            return {'error': str(e)}
+
     def _format_books_for_prompt(self, books: List[Tuple[str, str]]) -> str:
-        """Formatea lista de libros para incluir en el prompt."""
+        """Formatea lista de libros organizados por categorías para mejor comprensión de la IA."""
         try:
             if not books:
                 return "No hay libros disponibles."
 
-            # Limitar a número manejable para el prompt
-            max_books = 80
-            limited_books = books[:max_books]
+            # Organizar por series y libros individuales
+            series_books = {}
+            standalone_books = []
 
-            formatted_books = []
-            for book_id, title in limited_books:
+            for book_id, title in books:
                 if book_id and title:
-                    clean_title = title.strip()[:100]  # Limitar longitud
-                    formatted_books.append(f"/{book_id} - {clean_title}")
+                    clean_title = title.strip()[:100]
 
-            books_text = "\n".join(formatted_books)
+                    # Detectar si es parte de una serie
+                    if any(indicator in clean_title for indicator in [
+                        " - Vol.", " - Parte", " - Volume", " - Tomo", " - Capítulo",
+                        "Vol. ", "Parte ", "Volume ", "Tomo "
+                    ]):
+                        # Extraer nombre base de la serie
+                        series_name = clean_title
+                        for separator in [" - Vol.", " - Parte", " - Volume", " - Tomo"]:
+                            if separator in series_name:
+                                series_name = series_name.split(separator)[0]
+                                break
 
-            if len(books) > max_books:
-                books_text += f"\n... y {len(books) - max_books} libros más disponibles"
+                        # Limpiar nombre de la serie
+                        series_name = series_name.strip()
 
-            return books_text
+                        if series_name not in series_books:
+                            series_books[series_name] = []
+                        series_books[series_name].append(f"/{book_id} - {clean_title}")
+                    else:
+                        standalone_books.append(f"/{book_id} - {clean_title}")
+
+            # Construir texto organizado
+            formatted_sections = []
+
+            # Sección de series (ordenadas alfabéticamente)
+            if series_books:
+                formatted_sections.append("🔗 **SERIES DISPONIBLES:**")
+
+                # Ordenar series por nombre
+                sorted_series = sorted(series_books.items())
+
+                for series_name, volumes in sorted_series:
+                    # Ordenar volúmenes de la serie
+                    volumes_sorted = sorted(volumes)
+
+                    series_section = f"\n📖 **{series_name}:**"
+
+                    # Mostrar hasta 12 volúmenes por serie para no saturar
+                    max_volumes = 12
+                    if len(volumes_sorted) <= max_volumes:
+                        series_section += "\n" + "\n".join(volumes_sorted)
+                    else:
+                        series_section += "\n" + "\n".join(volumes_sorted[:max_volumes])
+                        series_section += f"\n... y {len(volumes_sorted) - max_volumes} volúmenes más de esta serie"
+
+                    formatted_sections.append(series_section)
+
+            # Sección de libros individuales (ordenados alfabéticamente)
+            if standalone_books:
+                formatted_sections.append("\n📚 **LIBROS INDIVIDUALES:**")
+
+                # Ordenar alfabéticamente
+                standalone_sorted = sorted(standalone_books)
+
+                # Mostrar hasta 80 libros individuales
+                max_standalone = 80
+                if len(standalone_sorted) <= max_standalone:
+                    formatted_sections.append("\n".join(standalone_sorted))
+                else:
+                    formatted_sections.append("\n".join(standalone_sorted[:max_standalone]))
+                    formatted_sections.append(
+                        f"... y {len(standalone_sorted) - max_standalone} libros individuales más")
+
+            # Estadísticas finales
+            total_series = len(series_books)
+            total_volumes = sum(len(volumes) for volumes in series_books.values())
+            total_standalone = len(standalone_books)
+            total_books = total_volumes + total_standalone
+
+            stats_section = f"""
+    📊 **RESUMEN DE BIBLIOTECA:**
+    • {total_series} series con {total_volumes} volúmenes
+    • {total_standalone} libros individuales
+    • **TOTAL: {total_books} libros disponibles**"""
+
+            formatted_sections.append(stats_section)
+
+            return "\n".join(formatted_sections)
 
         except Exception as e:
             log_service_error("RecommendationService", e)
-            return "Error cargando lista de libros."
+            self.logger.error(f"Error organizando biblioteca: {e}")
+            return f"Error organizando biblioteca. Total de libros: {len(books)}"
 
     def _format_popular_books(self, popular_books: List) -> str:
         """Formatea libros populares para el prompt."""
