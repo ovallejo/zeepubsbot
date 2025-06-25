@@ -4,6 +4,7 @@ Código limpio, simple y sin errores.
 """
 
 import json
+import random
 from typing import Dict, Optional, Any
 import time
 
@@ -386,18 +387,15 @@ class TelegramHandlers:
             for book in books:
                 self.book_repository.increment_searches(book.book_id)
 
-            # *** CORRECCIÓN: Convertir a tuplas correctamente ***
+            # Convertir a tuplas correctamente
             books_tuples = []
             for book in books:
                 try:
-                    # Si book ya es un modelo Book, usar to_legacy_tuple()
                     if hasattr(book, 'to_legacy_tuple'):
                         books_tuples.append(book.to_legacy_tuple())
-                    # Si book es una tupla, usarla directamente
                     elif isinstance(book, tuple):
                         books_tuples.append(book)
                     else:
-                        # Fallback: construir tupla manualmente
                         book_tuple = (
                             getattr(book, 'id', None),
                             getattr(book, 'book_id', ''),
@@ -419,17 +417,22 @@ class TelegramHandlers:
                     self.logger.warning(f"Error convirtiendo libro a tupla: {e}")
                     continue
 
-            # Guardar resultados de búsqueda en contexto
+            # *** FIX: Guardar contexto de búsqueda con información clara ***
             user_id = update.effective_user.id
             context.bot_data[f'search_results_{user_id}'] = {
                 'books': books_tuples,
-                'query': book_name,
-                'timestamp': time.time()  # *** USAR time.time() en lugar de update.message.date.timestamp() ***
+                'query': book_name,  # *** IMPORTANTE: Guardar query original ***
+                'menu_type': 'm_ebook',  # *** NUEVO: Guardar tipo de menú ***
+                'timestamp': time.time()
             }
 
             # Crear paginación con contexto de búsqueda
             keyboard, message = self._create_book_pagination(books_tuples, 'm_ebook')
             await self._send_message(update, message, ParseMode.MARKDOWN, keyboard)
+
+            # Limpiar contextos antiguos ocasionalmente
+            if random.random() < 0.1:  # 10% de las veces
+                self._cleanup_old_search_contexts(context)
 
         except Exception as e:
             await self._handle_error(update, e, "ebook")
@@ -439,16 +442,16 @@ class TelegramHandlers:
         try:
             current_time = time.time()
 
-            # Buscar claves de búsqueda antiguos (más de 1 hora)
+            # Buscar claves de búsqueda antiguos (más de 4 horas)
             keys_to_remove = []
-            for key in list(context.bot_data.keys()):  # Usar list() para evitar modificación durante iteración
+            for key in list(context.bot_data.keys()):
                 if key.startswith('search_results_'):
                     search_data = context.bot_data.get(key)
                     if isinstance(search_data, dict) and 'timestamp' in search_data:
-                        if current_time - search_data['timestamp'] > 3600:  # 1 hora
+                        if current_time - search_data['timestamp'] > 14400:  # 4 horas
                             keys_to_remove.append(key)
 
-            # Remover contextos antiguos
+            # Remover contextos muy antiguos
             for key in keys_to_remove:
                 context.bot_data.pop(key, None)
 
@@ -659,8 +662,11 @@ class TelegramHandlers:
         except Exception as e:
             await self._handle_error(update, e, "book_callback")
 
+    # EN: handlers/telegram_handlers.py
+    # REEMPLAZAR el método pagination_callback completo
+
     async def pagination_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Maneja callbacks de paginación conservando el contexto de búsqueda."""
+        """Maneja callbacks de paginación manteniendo el contexto de búsqueda."""
         try:
             query = update.callback_query
             await query.answer()
@@ -674,29 +680,47 @@ class TelegramHandlers:
                 return
 
             page = int(parts[1])
-            menu = parts[2]
+            menu_type = parts[2].strip()  # Asegurar que no hay espacios
 
             # Obtener libros del contexto guardado
             user_id = update.effective_user.id
             search_data = context.bot_data.get(f'search_results_{user_id}')
 
+            # *** FIX PRINCIPAL: Mejor manejo del contexto ***
             if search_data and 'books' in search_data:
-                # Usar resultados guardados (búsqueda o lista completa)
+                # Usar resultados guardados
                 books = search_data['books']
 
-                # Verificar si los datos no son muy antiguos (30 minutos)
-                if time.time() - search_data.get('timestamp', 0) > 1800:  # 30 minutos
-                    # Datos muy antiguos, regenerar según el tipo
-                    if search_data.get('query'):
-                        # Era una búsqueda, repetir búsqueda
+                # *** NUEVO: Solo regenerar si el contexto es muy específico ***
+                # Si los datos tienen más de 2 horas (no 30 minutos), regenerar
+                time_threshold = 7200  # 2 horas en lugar de 30 minutos
+
+                if time.time() - search_data.get('timestamp', 0) > time_threshold:
+                    self.logger.debug(f"Datos muy antiguos, regenerando para menu_type: {menu_type}")
+
+                    # *** FIX: Usar menu_type para determinar qué regenerar ***
+                    if menu_type == 'm_ebook' and search_data.get('query'):
+                        # Definitivamente era una búsqueda
                         self.logger.debug(f"Regenerando búsqueda: {search_data['query']}")
                         book_objects = self.book_repository.search(search_data['query'])
-                    else:
-                        # Era lista completa, obtener lista actualizada
+                        new_menu_type = 'm_ebook'
+                    elif menu_type == 'm_list':
+                        # Definitivamente era lista completa
                         self.logger.debug("Regenerando lista completa")
                         book_objects = self.book_repository.find_all()
+                        new_menu_type = 'm_list'
+                    else:
+                        # Caso ambiguo: usar el query si existe
+                        if search_data.get('query'):
+                            self.logger.debug(f"Caso ambiguo con query, regenerando búsqueda: {search_data['query']}")
+                            book_objects = self.book_repository.search(search_data['query'])
+                            new_menu_type = 'm_ebook'
+                        else:
+                            self.logger.debug("Caso ambiguo sin query, regenerando lista")
+                            book_objects = self.book_repository.find_all()
+                            new_menu_type = 'm_list'
 
-                    # Convertir a tuplas
+                    # Convertir a tuplas y actualizar cache
                     books = []
                     for book in book_objects:
                         try:
@@ -727,18 +751,34 @@ class TelegramHandlers:
                             self.logger.warning(f"Error convirtiendo libro en paginación: {e}")
                             continue
 
-                    # Actualizar cache
+                    # Actualizar cache con datos frescos
                     context.bot_data[f'search_results_{user_id}'] = {
                         'books': books,
-                        'query': search_data.get('query'),
+                        'query': search_data.get('query'),  # Mantener query original
                         'timestamp': time.time()
                     }
-            else:
-                # Fallback: si no hay contexto, obtener todos los libros
-                self.logger.debug("No hay contexto guardado, obteniendo todos los libros")
-                book_objects = self.book_repository.find_all()
-                books = []
 
+                    # *** IMPORTANTE: Mantener el menu_type correcto ***
+                    menu_type = new_menu_type
+
+                else:
+                    # Datos frescos, usar directamente
+                    self.logger.debug(f"Usando datos cacheados frescos para {menu_type}")
+            else:
+                # *** FIX: Si no hay contexto, usar menu_type para decidir ***
+                self.logger.debug(f"No hay contexto guardado, determinando acción por menu_type: {menu_type}")
+
+                if menu_type == 'm_ebook':
+                    # Si es m_ebook sin contexto, es problemático - usar lista completa
+                    self.logger.warning("m_ebook sin contexto de búsqueda, usando lista completa")
+                    book_objects = self.book_repository.find_all()
+                    menu_type = 'm_list'  # Cambiar a lista
+                else:
+                    # Para cualquier otro caso, usar lista completa
+                    book_objects = self.book_repository.find_all()
+
+                # Convertir a tuplas
+                books = []
                 for book in book_objects:
                     try:
                         if hasattr(book, 'to_legacy_tuple'):
@@ -746,7 +786,6 @@ class TelegramHandlers:
                         elif isinstance(book, tuple):
                             books.append(book)
                         else:
-                            # Fallback manual
                             book_tuple = (
                                 getattr(book, 'id', None),
                                 getattr(book, 'book_id', ''),
@@ -768,10 +807,10 @@ class TelegramHandlers:
                         self.logger.warning(f"Error en fallback de paginación: {e}")
                         continue
 
-                # Guardar en contexto para futuras paginaciones
+                # Guardar en contexto
                 context.bot_data[f'search_results_{user_id}'] = {
                     'books': books,
-                    'query': None,
+                    'query': None,  # Sin query porque es lista completa
                     'timestamp': time.time()
                 }
 
@@ -779,8 +818,11 @@ class TelegramHandlers:
                 await query.edit_message_text("No hay libros disponibles")
                 return
 
-            # Crear nueva paginación conservando el contexto
-            keyboard, message = self._create_book_pagination(books, menu, page)
+            # *** LOGGING PARA DEBUG ***
+            self.logger.info(f"Paginación: página {page}, tipo {menu_type}, libros: {len(books)}")
+
+            # Crear nueva paginación manteniendo el contexto correcto
+            keyboard, message = self._create_book_pagination(books, menu_type, page)
 
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id,
