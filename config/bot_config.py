@@ -78,12 +78,14 @@ class ConfigManager:
 
     def _setup_logging(self) -> None:
         """Configura el sistema de logging."""
+        log_path = os.getenv("BOT_LOG_FILE", "/var/log/zeepubsbot/zeepubsbot.log")
+
         logging.basicConfig(
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
             level=logging.INFO,
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler("zeepubsbot.log", encoding="utf-8")
+                logging.FileHandler(log_path, encoding="utf-8")
             ]
         )
 
